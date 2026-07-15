@@ -1,0 +1,788 @@
+% LLNCS/Springer draft for SOICT-style proceedings.
+\documentclass[runningheads]{llncs}
+
+\usepackage[T1]{fontenc}
+\usepackage{lmodern} % Vector CM-compatible fonts; this host lacks CM-Super Type 1.
+\usepackage{graphicx}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{float}
+
+\begin{document}
+
+\title{MixiMotion: A One-Step HY-Motion-1.0 Model for Text-to-Motion Generation}
+\titlerunning{MixiMotion}
+
+\author{Anonymous Authors}
+\authorrunning{Anonymous Authors}
+\institute{Anonymous Institution\\
+\email{anonymous@example.com}}
+
+\maketitle
+
+\begin{abstract}
+Diffusion and flow-matching text-to-motion models can generate high quality
+3D human motion, but their multi-step sampling makes interactive deployment
+expensive. We present MixiMotion, our compact one-step HY-Motion-1.0 model
+designed to preserve semantic alignment while reducing inference to a single
+network evaluation. MixiMotion is trained with a
+progressive curriculum that first learns a one-step motion prior, then adds
+motion-quality curricula for contact and locomotion, followed by semantic
+balancing and preference optimization. Training uses cached motion samples
+produced by HY-Motion-1.0-Lite. Before retraining, we remove every cached row
+whose normalized prompt exactly matches an official Structured Semantic
+Alignment Evaluation (SSAE) prompt. On 1,969 videos per system, an all-frame
+native-video evaluation with Qwen/Qwen3-VL-30B-A3B-Instruct-FP8 gives 0.8802
+for MixiMotion, compared with 0.8856 for HY-Motion-1.0 full, 0.8764 for
+MotionHiFlow, and 0.8415 for MotionLCM. Under this judge, MixiMotion retains
+99.4\% of the full model's SSAE score while using 460.0M rather than 1.04B
+motion-generator parameters and requiring one network evaluation per motion
+candidate. A blinded human study with 25 participants further rates
+MixiMotion at 4.33/5 for overall motion quality, compared with 4.50 for
+HY-Motion-1.0 full, 4.20 for MotionHiFlow, and 3.98 for MotionLCM.
+
+\keywords{Text-to-motion \and Knowledge distillation \and One-step generation \and Human motion synthesis \and Semantic alignment}
+\end{abstract}
+
+\section{Introduction}
+
+Text-to-motion generation converts natural-language descriptions into 3D human
+motion sequences. Recent flow-matching and diffusion-transformer systems such
+as HY-Motion-1.0~\cite{hymotion2025} provide strong semantic alignment and natural
+motion, but their iterative solvers are costly for interactive authoring,
+game engines, and web demos. A natural alternative is to distill the teacher
+into a one-step generator. However, naively matching teacher latents is not
+sufficient: motion quality constraints such as foot contact, root drift, and
+locomotion stability interact with semantic behaviors involving hands, torso,
+and object-like actions.
+
+This paper summarizes MixiMotion, our current one-step HY-Motion-1.0
+text-to-motion system. Rather than presenting a sequence of implementation
+versions, we frame the training process as a
+progressive curriculum. The curriculum starts from teacher imitation, adds
+motion-quality objectives, introduces balanced semantic groups, and finishes
+with preference optimization over teacher-generated candidates. This framing is
+important for reproducibility: the individual checkpoints are implementation
+milestones, whereas the method is the loss and data schedule.
+
+Our current experimental focus is not to claim a new state of the art over
+HY-Motion-1.0 full, but to quantify how close the one-step MixiMotion model
+can get to the full multi-step baseline under the same VLM-based semantic
+evaluation. The primary HY-Motion-family comparison shares the renderer and
+video settings; public baselines use the same native-video judge and questions
+but retain their native renderers.
+
+Our contributions are threefold:
+\begin{itemize}
+\item We formulate one-step HY-Motion distillation as bidirectional set
+matching between multiple student noise samples and multiple cached teacher
+motions, with an objective designed to preserve multi-sample coverage in a
+single network evaluation.
+\item We study a progressive training recipe that augments latent imitation
+with decoded motion constraints, semantic-group balancing, and
+distance-based preference fine-tuning. Our ablation reports non-monotonic
+outcomes rather than assuming that every stage is beneficial.
+\item We evaluate with native-video SSAE after removing exact text matches
+from the training bank. We report paired bootstrap intervals and a
+common-hardware efficiency comparison against HY-Motion-1.0 full,
+MotionHiFlow, and MotionLCM, together with a blinded human evaluation of
+semantic alignment, naturalness, and overall motion quality.
+\end{itemize}
+
+Figure~\ref{fig:overview} summarizes the offline teacher-cache construction and
+the one-step student supervision used to train MixiMotion.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\textwidth]{figures/miximotion_overview.png}
+\caption{Overview of MixiMotion distillation. A frozen HY-Motion-1.0-Lite
+teacher is run once to cache motion targets and text features. MixiMotion maps
+Gaussian noise to one-step motion candidates, supervised by latent set matching
+and decoded-motion matching; gradients update only the student.}
+\label{fig:overview}
+\end{figure}
+
+\section{Related Work}
+
+\paragraph{Text-to-motion generation.}
+Diffusion and flow-based models have substantially improved the diversity and
+semantic fidelity of text-conditioned human motion. HumanML3D established a
+large text-motion benchmark~\cite{humanml3d2022}; T2M-GPT models discrete
+motion tokens autoregressively~\cite{t2mgpt2023}; and MLD performs diffusion in
+a compact motion latent space~\cite{mld2023}. MDM~\cite{mdm2022} introduced a
+strong motion-space diffusion formulation, while HY-Motion-1.0 scales
+flow-matching transformers and semantic evaluation~\cite{hymotion2025}.
+Efficiency-oriented work includes latent consistency training in
+MotionLCM~\cite{motionlcm2024}, one-step flow matching in
+MoFlow~\cite{moflow2024}, and hierarchical flow matching in
+MotionHiFlow~\cite{motionhiflow2026}. MixiMotion differs in targeting the
+HY-Motion latent and conditioning interface directly, allowing a controlled
+comparison with the full HY-Motion-1.0 generator.
+
+\paragraph{Fast generative-model distillation.}
+Progressive distillation reduces iterative samplers by repeatedly teaching a
+student to replace multiple teacher steps~\cite{progressivedistill2022}, while
+consistency models learn outputs that agree across points of a diffusion
+trajectory~\cite{consistencymodels2023}. Our setting instead caches several
+complete teacher motions per prompt and learns a direct one-pass mapping. This
+avoids online teacher evaluation but requires the student to cover a
+multi-modal target set.
+
+\paragraph{Set matching and preference learning.}
+Implicit maximum likelihood estimation matches generated samples to nearby
+observations and offers an alternative to pointwise regression for
+multi-modal generation~\cite{imle2018}. We use bidirectional nearest-neighbor
+coverage over student and teacher sets. In the final stage, we adapt the
+relative-preference principle of DPO~\cite{dpo2023} to distance-based motion
+scores with a frozen pre-preference student as reference. Unlike reward-model
+training, preference pairs are derived from deterministic physical statistics
+of cached teacher candidates.
+
+\section{Method}
+
+\subsection{Teacher and MixiMotion}
+
+Let $G_T$ denote a multi-step HY-Motion-1.0 teacher and $G_\theta$ denote
+MixiMotion. Given a text prompt $p$, the teacher produces a set of candidate
+normalized motion latents
+\begin{equation}
+  \mathcal{Y}_T(p) = \{y_1, \ldots, y_K\},
+\end{equation}
+where each candidate is generated with a deterministic seed. MixiMotion
+receives the same text representation and predicts a motion latent in one
+network evaluation. Concretely, the student input consists of Gaussian noise
+tokens $z \in \mathbb{R}^{T \times D}$, token-level text context $C(p)$, a
+global text vector $v(p)$, and a temporal validity mask $m$. The student maps
+\begin{equation}
+  \hat{y} = G_\theta(z, C(p), v(p), m), \qquad z \sim \mathcal{N}(0, I),
+\end{equation}
+where $T$ is the motion length and $D$ is the latent dimension. The implemented
+network encodes the noise tokens, text context, and text vector separately,
+forms a conditioning adapter from a masked noise summary and the text vector,
+passes motion and text features through double-stream and single-stream
+multimodal DiT blocks, and predicts the final normalized motion latent. A
+frozen teacher decoder is used only to recover joint trajectories for
+motion-quality analysis and video rendering.
+
+\subsection{Progressive Curriculum Distillation}
+
+The training recipe has four stages. Let
+$\mathcal{X}_\theta(p)=\{\hat{y}_1,\ldots,\hat{y}_M\}$ be $M$ student
+candidates generated from independent Gaussian noise tokens for the same
+prompt. For two motion latents $a,b$ with valid length $\ell$, we use a masked
+Smooth-L1 distance
+\begin{equation}
+  d_\delta(a,b;\ell)
+  = \frac{1}{\ell D} \sum_{t=1}^{\ell} \sum_{d=1}^{D}
+  \rho_\delta(a_{t,d}-b_{t,d}),
+\end{equation}
+where $\rho_\delta$ is the Smooth-L1 penalty with transition point $\delta$.
+
+\subsubsection{Base one-step distillation.}
+The first stage learns the teacher distribution using a set-to-set IMLE-style
+objective. For each prompt, MixiMotion draws several candidates and is matched
+to the closest teacher candidate. Unlike a single nearest-neighbor loss, the
+implemented objective uses both teacher-to-student and student-to-teacher
+coverage terms:
+\begin{equation}
+  \mathcal{L}_{\mathrm{set}}
+  = \alpha_{\mathrm{t2s}}\frac{1}{K}\sum_{j=1}^{K}
+    \min_{i \le M} d_\delta(\hat{y}_i,y_j;\ell)
+  + \alpha_{\mathrm{s2t}}\frac{1}{M}\sum_{i=1}^{M}
+    \min_{j \le K} d_\delta(\hat{y}_i,y_j;\ell).
+\end{equation}
+The implemented base loss also includes endpoint and trajectory terms in the
+normalized representation and decoded body-space supervision:
+\begin{equation}
+  \mathcal{L}_{\mathrm{base}}
+  = \mathcal{L}_{\mathrm{set}}
+  + \lambda_{\mathrm{end}}\mathcal{L}_{\mathrm{end}}
+  + \lambda_{\mathrm{traj}}\mathcal{L}_{\mathrm{traj}}
+  + \sum_{r\in\mathcal{R}_{\mathrm{base}}}\lambda_r\mathcal{L}_r .
+\end{equation}
+Here, $\mathcal{R}_{\mathrm{base}}$ contains decoded body, foot, key-joint, and
+contact terms. These terms use the same temporal mask and bidirectional
+nearest-match reduction where a candidate set is involved. This stage gives
+MixiMotion a broad one-step motion prior while exposing the latent predictor
+to trajectory and body-space errors that latent distance alone may hide.
+
+\subsubsection{Motion-quality curriculum.}
+The second stage decodes both teacher and student candidates and applies
+bidirectional nearest-neighbor matching in body space. The supervision covers
+body position, velocity, and acceleration; foot position, velocity, and
+contact velocity; stride, foot lift, and alternating contact; and root, yaw,
+and arm-motion statistics. Training first performs gait/body matching, then a
+hard-locomotion subphase oversamples locomotion prompts by a factor of six and
+increases the emphasis on stride, lift, and contact. These terms target
+sliding, weak steps, and unstable lower-body motion without introducing an
+online teacher.
+
+\subsubsection{Semantic-balanced curriculum.}
+The third stage balances two lexical training lanes: locomotion and
+stationary/localized actions. Prompts in both lanes are oversampled by a
+factor of four. Locomotion examples retain stride, foot-lift, and alternating
+contact supervision, whereas localized actions such as reaching, waving,
+sitting, kneeling, or squatting receive root-displacement and root-velocity
+penalties to discourage unintended translation. The anchored and other groups
+are not separate lanes in this stage; they are introduced only by the
+group-aware preference scoring described next.
+
+\subsubsection{Preference optimization.}
+Finally, we build preference pairs from teacher candidates. For each prompt,
+the best and worst teacher candidates are selected according to the
+group-aware motion-quality score $q(y,p)$. For locomotion prompts, $q$ rewards
+foot lift, alternating contact, and stride while penalizing skating and contact
+velocity. For stationary and anchored prompts, $q$ penalizes root displacement,
+root velocity, skating, and unnecessary foot lift. Other prompts use a mixed
+score that mildly rewards visible motion while penalizing instability. The
+winner and loser are
+\begin{equation}
+  y^+ = \arg\max_{y_j \in \mathcal{Y}_T(p)} q(y_j,p),
+  \qquad
+  y^- = \arg\min_{y_j \in \mathcal{Y}_T(p)} q(y_j,p).
+\end{equation}
+MixiMotion is then optimized with a DPO-style preference objective plus
+supervised fine-tuning toward the preferred candidate. A frozen reference
+student $G_{\mathrm{ref}}$ is initialized from the model before preference
+training and evaluated on the same sampled noise tokens. Define the best-of-$M$
+score
+\begin{equation}
+  s_\theta(y) = -\min_{i \le M} d_\delta(\hat{y}_i,y;\ell),
+  \qquad
+  s_{\mathrm{ref}}(y) = -\min_{i \le M}
+  d_\delta(\hat{y}^{\mathrm{ref}}_i,y;\ell).
+\end{equation}
+The preference loss is
+\begin{equation}
+  \mathcal{L}_{\mathrm{DPO}}
+  = -\log \sigma\left(
+    \beta\left[
+    (s_\theta(y^+) - s_\theta(y^-))
+    - (s_{\mathrm{ref}}(y^+) - s_{\mathrm{ref}}(y^-))
+    \right]\right),
+\end{equation}
+and the reported preference stage uses
+\begin{equation}
+  \mathcal{L}_{\mathrm{pref}}
+  = \mathcal{L}_{\mathrm{DPO}}
+  + \lambda_{\mathrm{sft}}\min_{i \le M}d_\delta(\hat{y}_i,y^+;\ell).
+\end{equation}
+This final stage sharpens MixiMotion without asking the preference loss to
+learn the full motion prior from scratch.
+
+\subsection{Training Algorithm}
+
+\noindent\textbf{Algorithm 1: Progressive distillation for MixiMotion.}
+\begin{enumerate}
+\item Build a curated prompt bank from text-to-motion descriptions.
+\item For each prompt $p$, run the frozen HY-Motion-1.0-Lite teacher with $K$
+deterministic seeds and cache $\mathcal{Y}_T(p)$, text features, and motion
+latents.
+\item Normalize cached and SSAE prompt text with the same deterministic rule,
+remove every exact match from the teacher cache, and verify that the remaining
+exact normalized-text overlap is zero.
+\item Train MixiMotion with $\mathcal{L}_{\mathrm{base}}$ using $M$ randomly
+sampled noise candidates per prompt and bidirectional latent/body-space
+matching.
+\item Continue with gait/body matching, then oversample locomotion prompts by
+$6\times$ for the hard-locomotion subphase.
+\item Continue with the semantic-balanced curriculum, oversampling locomotion
+and stationary/localized prompts by $4\times$ and applying group-specific gait
+or root-stability terms.
+\item Construct preference pairs $(p,y^+,y^-)$ from the cached teacher
+candidates using the group-aware score $q(y,p)$.
+\item Freeze a reference copy of the pre-preference student, then optimize
+$\mathcal{L}_{\mathrm{pref}}$ with the same noise tokens for the student and
+reference candidates.
+\item Return the exponential-moving-average student as MixiMotion.
+\end{enumerate}
+
+\begin{table}
+\caption{Selected implementation details for the reported MixiMotion training
+run.}
+\label{tab:training-details}
+\centering
+\begin{tabular}{ll}
+\hline
+Item & Value \\
+\hline
+Teacher for cached samples & HY-Motion-1.0-Lite \\
+Teacher-bank rows after filtering & 48,065 \\
+Exact normalized-text SSAE overlap & 0 \\
+Teacher candidates per prompt $K$ & 4 \\
+Student candidates, base distillation $M$ & 8 \\
+Student candidates, preference stage $M$ & 4 \\
+Motion length & 120 frames \\
+Optimizer & AdamW \\
+Base stage & 18 epochs at $8.0 \times 10^{-5}$ \\
+Gait/body stage & 10 epochs at $3.0 \times 10^{-5}$ \\
+Hard-locomotion stage & 6 epochs at $2.0 \times 10^{-5}$ \\
+Semantic-balance stage & 4 epochs at $1.0 \times 10^{-5}$ \\
+Preference stage & 3 epochs at $2.0 \times 10^{-6}$ \\
+Batch size & 4 \\
+DPO inverse temperature $\beta$ & 8.0 \\
+SFT weight $\lambda_{\mathrm{sft}}$ & 0.35 \\
+Smooth-L1 transition $\delta$ & 0.35 \\
+Network evaluations per candidate & 1 \\
+EMA decay & 0.999 \\
+Base-stage split & 70\% / 15\% / 15\% (train/val/test) \\
+Preference-stage split & 90\% / 10\% (train/val) \\
+Precision & bfloat16 \\
+\hline
+\end{tabular}
+\end{table}
+
+Figure~\ref{fig:curriculum} illustrates the curriculum as four consecutive
+training stages rather than as implementation-version checkpoints.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\textwidth]{figures/miximotion_curriculum.png}
+\caption{Progressive curriculum used to train MixiMotion. Cached teacher
+supervision is reused across all stages; solid arrows denote EMA checkpoint
+handoff. The sequence does not imply monotonic improvement.}
+\label{fig:curriculum}
+\end{figure}
+
+\section{Experimental Setup}
+
+\subsection{Training Data}
+
+The reported model uses a curated prompt bank collected from
+HY-Motion-1.0 examples, ViMoGen motion annotations~\cite{vimogen2026}, and manually filtered
+text-to-motion descriptions. For each prompt, HY-Motion-1.0-Lite generates four
+teacher candidates at a fixed length of 120 frames. Before the reported
+retraining run, we normalize text by stripping outer whitespace, converting to
+lowercase, and collapsing repeated whitespace. We remove all 1,935 cached rows
+whose normalized text matches an SSAE prompt; these rows cover 1,883 unique
+SSAE prompts. The resulting teacher bank contains 48,065 samples, and a
+post-filter audit finds zero exact normalized-text overlap with all 1,969 SSAE
+prompts. All curriculum stages and the preference bank are then rebuilt from
+this filtered cache. This audit excludes exact text matches but does not rule
+out semantic paraphrases or near-duplicate descriptions.
+
+\subsection{Evaluation Protocol}
+
+We evaluate on SSAE~\cite{hymotion2025}, which decomposes each text prompt into
+fine-grained yes/no questions about visible motion semantics. We render one
+video per SSAE index and per generator, producing 1,969 videos for each system
+and 7,876 in total. A VLM answers all questions for each video, and the score
+is the ratio of yes answers. Our native-video protocol passes all 120 frames of
+each rendered sequence to Qwen/Qwen3-VL-30B-A3B-Instruct-FP8~\cite{qwen3vl2025};
+no temporal frame subsampling is used.
+
+The primary comparison uses two motion generators:
+\begin{itemize}
+\item \textbf{MixiMotion}: our current one-step HY-Motion-1.0 model retrained
+from the exact-text-filtered teacher bank.
+\item \textbf{HY-Motion-1.0 full}: the public multi-step HY-Motion-1.0 model
+rendered with the same SSAE prompts and 120-frame length. Each benchmark run
+uses the deterministic seed recorded in its manifest.
+\end{itemize}
+For external context, we also run SSAE on two public text-to-motion baselines
+with available checkpoints: \textbf{MotionHiFlow}~\cite{motionhiflow2026} and
+\textbf{MotionLCM}~\cite{motionlcm2024}. All systems use the same prompt-index
+mapping, 120-frame output length, SSAE questions, and native-video judge
+settings. MixiMotion and HY-Motion-1.0 full share the same 720$\times$720
+skeleton renderer, camera, and 30 FPS encoding (4 s). The public baselines use
+their native project renderers at 400$\times$400 and 300$\times$300,
+respectively, and are encoded at 20 FPS (6 s). We do not temporally rescale
+these motions because doing so changes their native execution speed;
+consequently, public-baseline scores are contextual rather than strictly
+renderer- and duration-controlled comparisons.
+
+For VLM judging, we use one all-frame native-video protocol:
+\begin{itemize}
+\item \textbf{Qwen/Qwen3-VL-30B-A3B-Instruct-FP8}, used for native-video
+evaluation with all 120 frames, identical SSAE questions, temperature zero,
+a 256-token response limit, and a strict yes/no JSON schema for every motion
+generator.
+\end{itemize}
+Strict structured decoding succeeded directly for 7,873 of the 7,876 videos.
+For three videos, the backend entered a whitespace loop after opening the JSON
+object. We reissued each question independently to the same model with the
+same 120-frame video, temperature, and yes/no instruction, changing only the
+output-format constraint. All four systems consequently contain 1,969
+successful videos and the same 6,418 answered questions.
+
+\subsection{Human Evaluation Protocol}
+
+To complement the VLM-based assessment, we conduct a blinded human evaluation
+with 25 participants familiar with computer graphics or motion synthesis. The
+study covers 300 SSAE prompts per system. For each prompt, model outputs are
+shown in randomized pairs with model identities and left--right ordering
+hidden. Participants assign an independent five-point Likert score to each
+video for: (1) semantic alignment with the input prompt, (2) motion
+naturalness, and (3) overall motion quality, including foot--ground contact,
+stability, and visible artifacts. The reported values aggregate ratings over
+the 300 prompts for each system. We report the mean and standard error, and use
+Krippendorff's alpha to summarize inter-rater agreement.
+
+\section{Results}
+
+\subsection{Curriculum Ablation}
+
+We use a cumulative ablation from the preceding development run to examine the
+effect of each curriculum stage. All variants use the same architecture,
+teacher cache, rendering pipeline, and native-video SSAE judge; only the
+indicated curriculum component is added. In addition to SSAE, we report
+foot-skating and contact metrics for every checkpoint. These exploratory
+ablation checkpoints predate exact-text filtering and are not mixed with the
+clean-retrained checkpoint in the main comparison.
+
+\begin{table}
+\caption{Exploratory cumulative ablation from the preceding development run.
+Higher SSAE and contact scores are better; lower foot skating is better.
+Physical metrics are dataset means over the 1,969 development motions. Best
+values are in bold.}
+\label{tab:curriculum-ablation}
+\centering
+\small
+\setlength{\tabcolsep}{6pt}
+\renewcommand{\arraystretch}{1.2}
+\begin{tabular*}{\textwidth}{@{\extracolsep{\fill}}lccc@{}}
+\hline
+Variant & \shortstack{Native-video\\SSAE} & Foot skating & Contact score \\
+\hline
+Base distillation & 0.8822 & \textbf{0.0401} & \textbf{0.7901} \\
+$+$ Motion-quality & 0.8802 & 0.0495 & 0.7621 \\
+$+$ Semantic balance & \textbf{0.8824} & 0.0589 & 0.7376 \\
+$+$ Preference/DPO (development) & 0.8813 & 0.0558 & 0.7513 \\
+\hline
+\end{tabular*}
+\end{table}
+
+Base distillation and semantic balancing obtain nearly identical SSAE scores.
+The motion-quality and final development preference checkpoints are lower than the base by
+0.0020 and 0.0009, respectively. The aggregate physical metrics are also
+non-monotonic: later stages have more foot skating and less contact than the
+base, while preference optimization partly reverses the changes introduced by
+semantic balancing. Thus, this ablation does not support a claim that every
+curriculum stage improves these aggregate metrics. For the development DPO
+checkpoint, the foot-skating ratio is $0.0558\pm0.1433$ and the contact ratio
+is $0.7513\pm0.3347$ across 1,969 motions. The same renderer-side implementation
+and thresholds are used for every checkpoint.
+
+\subsection{Model Size and Inference Cost}
+
+Table~\ref{tab:cost-results} compares model size, solver cost, and measured
+inference characteristics. Parameter counts are computed from saved generation
+checkpoints and exclude text encoders, VLM judges, and video renderers. The two
+HY-Motion-family rows count the motion transformer. MotionHiFlow combines its
+flow generator and VAE, whereas MotionLCM combines its denoiser and VAE; these
+external parameter scopes are therefore contextual rather than
+architecture-identical. Every system is profiled on the same RTX 5090 with
+batch size 1, bfloat16 precision, and 120 output frames. We perform 20
+unreported warm-up iterations followed by 100 timed iterations and synchronize
+CUDA before and after every measurement. Generation-only latency covers the
+native motion generator/solver. Model-native end-to-end latency additionally
+includes text encoding and each project's motion decoder, but excludes video
+rendering and VLM judging. HY-Motion-1.0 full and MixiMotion terminate at the
+same decoded HY-Motion representation. MotionHiFlow terminates at decoded
+motion features, while MotionLCM additionally converts features to joints and
+copies them to CPU. Thus, common hardware and timing controls are shared, but
+external end-to-end endpoints are not identical. We report mean, standard
+deviation, and 95th percentile. Peak VRAM is measured after resetting the CUDA
+peak-memory counter immediately before each timed scope.
+
+\begin{table}
+\caption{Controlled model-size and inference-cost profiling on 120-frame
+samples. Latency and memory use one RTX 5090/BF16 harness at batch size 1.
+External model-native endpoints differ as described in the text. Lower is
+better for every numeric column; best values are in bold.}
+\label{tab:cost-results}
+\centering
+\small
+\setlength{\tabcolsep}{6pt}
+\renewcommand{\arraystretch}{1.18}
+\textit{(a) Model complexity and memory}\\[2pt]
+\begin{tabular*}{\textwidth}{@{\extracolsep{\fill}}lccc@{}}
+\hline
+Model &
+\shortstack{Generator\\params (M)} &
+\shortstack{Sampling\\steps/NFE} &
+\shortstack{Peak VRAM\\(GiB)} \\
+\hline
+HY-Motion-1.0 full & 1042.9 & 50 & 23.23 \\
+MixiMotion (ours) & 460.0 & \textbf{1} & 20.73 \\
+MotionHiFlow & 33.1 & 12 & \textbf{0.43} \\
+MotionLCM & \textbf{26.5} & \textbf{1} & 1.45 \\
+\hline
+\end{tabular*}
+
+\vspace{6pt}
+\textit{(b) Latency}\\[2pt]
+\setlength{\tabcolsep}{4pt}
+\begin{tabular*}{\textwidth}{@{\extracolsep{\fill}}lcccc@{}}
+\hline
+Model &
+\shortstack{Generation\\mean $\pm$ std (ms)} &
+\shortstack{Generation\\P95 (ms)} &
+\shortstack{End-to-end\\mean $\pm$ std (ms)} &
+\shortstack{End-to-end\\P95 (ms)} \\
+\hline
+HY-Motion-1.0 full & $829.58\pm3.19$ & 834.68 & $968.25\pm3.69$ & 974.94 \\
+MixiMotion (ours) & $9.30\pm0.39$ & 9.94 & $143.55\pm1.29$ & 145.67 \\
+MotionHiFlow & $111.19\pm15.98$ & 139.02 & $119.68\pm15.89$ & 148.68 \\
+MotionLCM & $\mathbf{3.04\pm0.24}$ & \textbf{3.35} & $\mathbf{13.94\pm0.47}$ & \textbf{14.85} \\
+\hline
+\end{tabular*}
+\end{table}
+
+MixiMotion uses 44.1\% of the HY-Motion-1.0 full motion-generator parameters
+and one network evaluation rather than 50 solver evaluations. Under the same
+HY-Motion-family scope, it is $89.2\times$ faster for generation alone and
+$6.75\times$ faster end to end. The smaller end-to-end gain reflects shared
+text-encoding and motion-decoding costs. In the model-native profiles,
+MixiMotion's one-step generator is $11.9\times$ faster than MotionHiFlow's
+12-step solver, and MotionLCM records the lowest latency and parameter count.
+Because their decoded endpoints differ, these cross-family latency values
+provide deployment context rather than a strict pipeline-level speedup claim.
+MotionLCM's lower SSAE score in Table~\ref{tab:native-video-ssae} further shows
+that computational cost and semantic alignment should be considered together.
+
+\subsection{Native-Video SSAE Evaluation}
+
+We evaluate all four generators with
+Qwen/Qwen3-VL-30B-A3B-Instruct-FP8 through its native video interface. Each
+request contains all 120 frames of one motion video and the same SSAE yes/no
+questions used for every system. The model identifier, frame count,
+temperature, response schema, and parsing procedure are held fixed. This
+protocol replaces the earlier frame-sampled Qwen experiment.
+
+\begin{table}
+\caption{SSAE scores under the all-frame native-video
+Qwen/Qwen3-VL-30B-A3B-Instruct-FP8 judge. MixiMotion is retrained after
+removing exact normalized-text SSAE matches from its teacher bank. Every system
+has 1,969 successful videos and 6,418 answered questions. Higher is better;
+the best score in each row is in bold.}
+\label{tab:native-video-ssae}
+\centering
+\small
+\setlength{\tabcolsep}{4pt}
+\renewcommand{\arraystretch}{1.15}
+\begin{tabular*}{\textwidth}{@{\extracolsep{\fill}}lcccc@{}}
+\hline
+Category &
+\shortstack{MixiMotion\\(ours)} &
+\shortstack{HY-Motion-1.0\\full} &
+\shortstack{Motion\\HiFlow} &
+\shortstack{Motion\\LCM} \\
+\hline
+Daily      & 0.9009 & \textbf{0.9075} & 0.8617 & 0.8065 \\
+Fitness    & 0.7487 & 0.7613 & \textbf{0.7717} & 0.7213 \\
+Game       & 0.9205 & \textbf{0.9215} & 0.9187 & 0.8977 \\
+Locomotion & \textbf{0.9757} & \textbf{0.9757} & 0.9689 & 0.9621 \\
+Social     & 0.9332 & 0.9419 & \textbf{0.9452} & 0.9211 \\
+Sports     & 0.8430 & \textbf{0.8451} & 0.8274 & 0.7807 \\
+\hline
+\textbf{Overall} & 0.8802 & \textbf{0.8856} &
+0.8764 & 0.8415 \\
+\hline
+\end{tabular*}
+\end{table}
+
+MixiMotion retains 99.4\% of the HY-Motion-1.0 full score, with an absolute
+gap of 0.0055. It matches the full model on locomotion at the reported
+precision and is within 0.0021 on game and sports prompts. MotionHiFlow is
+strongest on fitness and social among the compact models, while MixiMotion has
+the numerically highest compact-model overall score. These small differences should be
+interpreted cautiously because the exact-text audit does not exclude semantic
+near-duplicates and the experiment uses a single deterministic VLM judge. A
+paired video-level bootstrap with 10,000 resamples gives a 95\% confidence
+interval of $[0.8687, 0.8915]$ for MixiMotion and $[0.8746, 0.8964]$ for
+HY-Motion-1.0 full. The paired difference (MixiMotion minus full) is $-0.0055$
+with a 95\% interval of $[-0.0121, 0.0011]$, which includes zero.
+MotionHiFlow's paired difference is $-0.0092$ with interval
+$[-0.0186, 0.0002]$, whereas MotionLCM's difference is $-0.0441$ with interval
+$[-0.0553, -0.0332]$. Thus, under this protocol, the VLM scores do not resolve
+a statistically clear difference between MixiMotion and the full baseline.
+
+\subsection{Human Evaluation}
+
+Table~\ref{tab:human-evaluation} reports the human ratings. HY-Motion-1.0 full
+has the highest mean score on all three criteria. MixiMotion is the strongest
+compact system, exceeding MotionHiFlow and MotionLCM on semantic alignment,
+naturalness, and overall motion quality. Its descriptive gap from the full
+baseline is 0.16 for semantic alignment and 0.17 for both naturalness and
+overall quality. The aggregate inter-rater agreement is
+Krippendorff's $\alpha=0.68$.
+
+\begin{table}[H]
+\caption{Blinded human evaluation on a five-point Likert scale. Values are
+means over 300 prompts $\pm$ standard error. Higher is better. Bold denotes
+the best overall result and underlining denotes the best compact model.}
+\label{tab:human-evaluation}
+\centering
+\small
+\setlength{\tabcolsep}{4pt}
+\renewcommand{\arraystretch}{1.12}
+\begin{tabular*}{\textwidth}{@{\extracolsep{\fill}}lccc@{}}
+\hline
+Model &
+\shortstack{Semantic\\alignment} &
+Naturalness &
+\shortstack{Overall motion\\quality} \\
+\hline
+HY-Motion-1.0 full & $\mathbf{4.48\pm0.04}$ & $\mathbf{4.52\pm0.03}$ & $\mathbf{4.50\pm0.04}$ \\
+MixiMotion (ours) & $\underline{4.32\pm0.05}$ & $\underline{4.35\pm0.04}$ & $\underline{4.33\pm0.05}$ \\
+MotionHiFlow & $4.18\pm0.06$ & $4.22\pm0.05$ & $4.20\pm0.06$ \\
+MotionLCM & $3.95\pm0.07$ & $4.01\pm0.06$ & $3.98\pm0.07$ \\
+\hline
+\end{tabular*}
+\end{table}
+
+These descriptive results indicate that MixiMotion preserves much of the
+perceptual quality of the full HY-Motion-1.0 baseline while improving over the
+evaluated efficient baselines. They complement rather than replace the
+automated semantic and physical measurements.
+
+Figure~\ref{fig:qualitative} shows representative deterministic outputs from
+the two systems in the HY-Motion family. We render saved SMPL parameters directly
+with the same Three.js wooden-mesh visualizer used by the Streamlit demo. This
+comparison is intended to expose temporal pose differences rather than replace
+quantitative or human evaluation.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\textwidth]{figures/qualitative_comparison.png}
+\caption{Qualitative comparison on four SSAE prompts using the Streamlit
+Three.js wooden-mesh renderer. Each row shows three temporally ordered
+keyframes from the corresponding 120-frame output. For locomotion, early
+frames are selected because the demo camera remains fixed while the body
+translates. Both columns use identical rendering code and camera
+initialization.}
+\label{fig:qualitative}
+\end{figure}
+
+\section{Discussion}
+
+\subsection{Why a Curriculum Instead of a Single Stage?}
+
+The preference loss does not by itself teach the full motion prior, so the base
+distillation remains necessary to initialize the one-step mapping. The later
+stages target gait/contact behavior, semantic balance, and candidate
+preference. However, Table~\ref{tab:curriculum-ablation} shows that their
+effects are not captured as monotonic gains in aggregate native-video SSAE,
+foot skating, or contact ratio. More targeted per-group physical metrics and
+an independently sourced prompt benchmark are needed to establish which later
+stages are beneficial.
+
+\subsection{Scaling the Development Data}
+
+Daily and social prompts contain many fine-grained hand, torso, and interaction
+cues that are difficult for compact one-step generators. We therefore expect
+larger, curated prompt banks to be particularly useful for these behaviors.
+Future scaling should use held-out validation prompts and human inspection
+rather than selecting examples from benchmark failures.
+
+\subsection{Limitations}
+
+First, MixiMotion is distilled from HY-Motion-1.0-Lite rather than
+from the full HY-Motion-1.0 teacher. This may impose a ceiling on semantic
+alignment. Second, although exact normalized-text SSAE matches are removed
+before retraining, we have not performed semantic near-duplicate detection
+across the remaining training descriptions; the result therefore establishes
+exact-text decontamination rather than complete semantic independence. Third,
+SSAE uses VLM judgments over rendered skeleton videos, so the resulting scores
+remain dependent on the selected judge. Although the human study provides an
+independent perceptual assessment, it is limited to 25 participants and 300
+prompts per system. SSAE also measures semantic question answering rather than
+distributional fidelity or motion diversity. Fourth, MixiMotion is evaluated
+at a fixed 120-frame length. The HY-Motion-family
+videos are encoded at 30 FPS, whereas the public baselines are encoded at
+20 FPS, so the baseline comparison is not perfectly duration controlled.
+Variable-length and prompt-engineered generation remain future work.
+
+\section{Conclusion}
+
+We presented MixiMotion, our one-step HY-Motion-1.0 model trained with a
+progressive curriculum distillation recipe for text-to-motion generation.
+MixiMotion uses one-step inference and 460.0M rather than 1.04B
+motion-generator parameters. After retraining on a teacher bank with zero
+exact normalized-text SSAE overlap, MixiMotion obtains 0.8802 SSAE versus
+0.8856 for HY-Motion-1.0 full in the all-frame native-video evaluation,
+retaining 99.4\% of its score and obtaining the highest numerical score among
+the evaluated compact models. Public-baseline comparisons remain contextual
+because their native renderers and frame rates differ. The method provides a
+practical route toward interactive text-to-motion systems. The blinded human
+study likewise places MixiMotion above the evaluated compact baselines and
+slightly below HY-Motion-1.0 full, while evaluation on an independently
+sourced benchmark remains important for establishing broader generalization.
+
+\begin{credits}
+\subsubsection{\ackname} The authors thank the maintainers of HY-Motion-1.0,
+SSAE, ViMoGen, and the open-source text-to-motion ecosystem for releasing
+models, prompts, and evaluation tools.
+
+\subsubsection{\discintname}
+The authors have no competing interests to declare that are relevant to the
+content of this article.
+\end{credits}
+
+\begin{thebibliography}{99}
+
+\bibitem{hymotion2025}
+Tencent Hunyuan 3D Digital Human Team: HY-Motion-1.0: Scaling Flow Matching
+Models for Text-to-Motion Generation. arXiv preprint arXiv:2512.23464 (2025)
+
+\bibitem{moflow2024}
+Wang, Y., et al.: MoFlow: One-Step Flow Matching for Human Motion Generation.
+arXiv preprint arXiv:2503.09950 (2025)
+
+\bibitem{motionlcm2024}
+Chen, L., et al.: MotionLCM: Real-time Controllable Motion Generation via
+Latent Consistency Model. arXiv preprint arXiv:2404.19759 (2024)
+
+\bibitem{motionhiflow2026}
+Li, H., Lin, X., Zeng, L.-A., Kang, Y., Li, S., Hu, J.-F.:
+MotionHiFlow: Text-to-Motion via Hierarchical Flow Matching. In:
+Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern
+Recognition (CVPR) (2026)
+
+\bibitem{mdm2022}
+Tevet, G., Raab, S., Gordon, B., Shafir, Y., Cohen-Or, D., Bermano, A.H.:
+Human Motion Diffusion Model. In: ICLR (2023)
+
+\bibitem{humanml3d2022}
+Guo, C., Zou, S., Zuo, X., Wang, S., Ji, W., Li, X., Cheng, L.:
+Generating Diverse and Natural 3D Human Motions from Text. In: CVPR (2022)
+
+\bibitem{t2mgpt2023}
+Zhang, J., Zhang, Y., Cun, X., Huang, S., Zhang, Y., Zhao, H., Lu, H.,
+Shan, Y.: Generating Human Motion from Textual Descriptions with Discrete
+Representations. In: CVPR (2023)
+
+\bibitem{mld2023}
+Chen, X., Jiang, B., Liu, W., Huang, Z., Fu, B., Chen, T., Yu, G.:
+Executing Your Commands via Motion Diffusion in Latent Space. In: CVPR (2023)
+
+\bibitem{vimogen2026}
+ViMoGen: Large-scale video-to-motion prompt and motion dataset. Hugging Face
+dataset repository, \url{https://huggingface.co/datasets/wruisi/ViMoGen-228K}
+
+\bibitem{progressivedistill2022}
+Salimans, T., Ho, J.: Progressive Distillation for Fast Sampling of Diffusion
+Models. In: International Conference on Learning Representations (ICLR) (2022)
+
+\bibitem{consistencymodels2023}
+Song, Y., Dhariwal, P., Chen, M., Sutskever, I.: Consistency Models. In:
+Proceedings of the 40th International Conference on Machine Learning (ICML),
+pp. 32211--32252 (2023)
+
+\bibitem{imle2018}
+Li, K., Malik, J.: Implicit Maximum Likelihood Estimation. arXiv preprint
+arXiv:1809.09087 (2018)
+
+\bibitem{dpo2023}
+Rafailov, R., Sharma, A., Mitchell, E., Manning, C.D., Ermon, S., Finn, C.:
+Direct Preference Optimization: Your Language Model Is Secretly a Reward
+Model. In: Advances in Neural Information Processing Systems 36 (2023)
+
+\bibitem{qwen3vl2025}
+Bai, S., et al.: Qwen3-VL Technical Report. arXiv preprint arXiv:2511.21631
+(2025)
+
+\end{thebibliography}
+
+\end{document}
